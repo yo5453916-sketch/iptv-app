@@ -1,0 +1,312 @@
+name: Build IPTV APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Patch index.html (rotation, VLC, pinned servers)
+        run: |
+          cat > patch.py <<'PYEOF'
+          import sys
+          p = 'index.html'
+          s = open(p, encoding='utf-8').read()
+          if 'const nat=' in s:
+              print('already patched'); sys.exit(0)
+
+          def rep(old, new):
+              global s
+              assert s.count(old) == 1, (s.count(old), old[:70])
+              s = s.replace(old, new)
+
+          # ---- 1) fullscreen + landscape ----
+          a = s.index("async function enterPlayerFullscreen(vod){")
+          b = s.index("function updatePlayingMarks(){")
+          new = '''const nat=()=>(window.Capacitor&&window.Capacitor.Plugins&&window.Capacitor.Plugins.Native)||null;
+          function nativeRestore(){const N=nat();if(!N)return;try{N.setOrientation({mode:'auto'});N.setImmersive({on:false});}catch(e){}}
+          const _withTimeout=(p,ms)=>Promise.race([Promise.resolve(p),new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),ms))]);
+          async function enterPlayerFullscreen(vod){
+            const el=$('playerScreen');
+            const N=nat();
+            if(N){
+              if(vod)lockLandscape();
+              try{N.setImmersive({on:true});}catch(e){}
+              return;
+            }
+            if(vod)lockLandscape();
+            let ok=_isFs();
+            if(!ok){
+              try{
+                if(el.requestFullscreen){await _withTimeout(el.requestFullscreen(),1500);ok=_isFs();}
+                else if(el.webkitRequestFullscreen){el.webkitRequestFullscreen();ok=true;}
+              }catch(e){ok=false;}
+            }
+            if(!ok&&!_fsArmed){
+              _fsArmed=true;
+              const retry=()=>{_fsArmed=false;el.removeEventListener('touchend',retry);el.removeEventListener('click',retry);
+                if(activeScreenId()==='playerScreen'&&!_isFs())enterPlayerFullscreen(vod);};
+              el.addEventListener('touchend',retry,{once:true});el.addEventListener('click',retry,{once:true});
+            }
+          }
+          async function lockLandscape(){
+            const el=$('playerScreen');
+            let locked=false;
+            const N=nat();
+            if(N){try{await N.setOrientation({mode:'landscape'});locked=true;}catch(e){}}
+            else try{
+              if(screen.orientation&&screen.orientation.lock){
+                await _withTimeout(screen.orientation.lock('landscape'),1200);
+                locked=true;
+              }
+            }catch(e){}
+            await new Promise(r=>setTimeout(r,350));
+            const isPortrait=window.innerHeight>window.innerWidth;
+            if(locked&&!isPortrait){_autoRot=false;el.classList.remove('rot90');}
+            else if(isPortrait){_autoRot=true;el.classList.add('rot90');}
+          }
+          window.addEventListener('resize',()=>{
+            if(!_autoRot||activeScreenId()!=='playerScreen')return;
+            $('playerScreen').classList.toggle('rot90',window.innerHeight>window.innerWidth);
+          });
+          '''
+          s = s[:a] + new + s[b:]
+
+          # ---- 2) rotate button ----
+          a = s.index("$('rotBtn').addEventListener('click',async()=>{")
+          b = s.index("// VLC open")
+          new = '''$('rotBtn').addEventListener('click',async()=>{
+            _autoRot=false;
+            const el=$('playerScreen');
+            const N=nat();
+            if(N){
+              el.classList.remove('rot90');
+              const land=window.innerWidth>window.innerHeight;
+              try{await N.setOrientation({mode:land?'portrait':'landscape'});}catch(e){}
+              showControls();return;
+            }
+            if(el.classList.contains('rot90')){el.classList.remove('rot90');showControls();return;}
+            let done=false;
+            try{
+              if(screen.orientation&&screen.orientation.lock){
+                const land=(screen.orientation.type||'').startsWith('landscape')||window.innerWidth>window.innerHeight;
+                const wasPortrait=window.innerHeight>window.innerWidth;
+                await _withTimeout(screen.orientation.lock(land?'portrait':'landscape'),1200);
+                await new Promise(r=>setTimeout(r,350));
+                done=(window.innerHeight>window.innerWidth)!==wasPortrait;
+              }
+            }catch(e){}
+            if(!done)el.classList.add('rot90');
+            showControls();
+          });
+
+          '''
+          s = s[:a] + new + s[b:]
+
+          # ---- 3) VLC ----
+          a = s.index("function openInVlc(url){")
+          b = s.index("$('vlcBtn').addEventListener")
+          new = '''let _vlcOpening=false;
+          function openInVlc(url){
+            if(!url||_vlcOpening)return;
+            const N=nat();
+            if(N){
+              try{$('playerVideo').pause();}catch(e){}
+              N.openVlc({url:String(url)}).catch(()=>toast('VLC مش متثبت على الجهاز — نزّله من Google Play','err'));
+              return;
+            }
+            _vlcOpening=true;_fsUserExit=true;
+            try{$('playerVideo').pause();}catch(e){}
+            const m=String(url).match(/^(https?):\\/\\/(.+)$/i);
+            const scheme=m?m[1].toLowerCase():'http';
+            const rest=m?m[2]:String(url);
+            const intent='intent://'+rest+'#Intent;scheme='+scheme+';action=android.intent.action.VIEW;type=video/*;package=org.videolan.vlc;end';
+            let left=false;
+            const onHide=()=>{if(document.hidden)left=true;};
+            document.addEventListener('visibilitychange',onHide);
+            try{
+              const a=document.createElement('a');
+              a.href=intent;a.style.display='none';
+              document.body.appendChild(a);a.click();
+              setTimeout(()=>a.remove(),500);
+            }catch(e){}
+            setTimeout(()=>{
+              document.removeEventListener('visibilitychange',onHide);
+              _vlcOpening=false;_fsUserExit=false;
+              if(!left)toast('مقدرتش أفتح VLC — اتأكد إنه متثبت، أو انسخ الرابط وافتحه جواه','err');
+            },2000);
+          }
+          '''
+          s = s[:a] + new + s[b:]
+
+          # ---- 4) leave player / exit ----
+          rep("  _autoRot=false;$('playerScreen').classList.remove('rot90');\n  try{screen.orientation&&screen.orientation.unlock",
+              "  _autoRot=false;$('playerScreen').classList.remove('rot90');\n  nativeRestore();\n  try{screen.orientation&&screen.orientation.unlock")
+          rep("  $('playerScreen').classList.remove('rot90');\n  try{screen.orientation&&screen.orientation.unlock",
+              "  $('playerScreen').classList.remove('rot90');\n  nativeRestore();\n  try{screen.orientation&&screen.orientation.unlock")
+
+          # ---- 5) fullscreen button ----
+          rep("$('fsBtn').addEventListener('click',()=>{\n  const el=$('playerScreen');",
+              "let _natImm=true;\n$('fsBtn').addEventListener('click',()=>{\n  const N=nat();\n  if(N){_natImm=!_natImm;try{N.setImmersive({on:_natImm});}catch(e){}showControls();return;}\n  const el=$('playerScreen');")
+
+          # ---- 6) pinned servers ----
+          rep("  {id:'pre_srv_3',type:'xtream',label:'Assad2026',host:'http://line.assad2026.site:80',user:'QMZy2025',pass:'eck3gzk2uf'},\n];",
+          """  {id:'pre_srv_3',type:'xtream',label:'Assad2026',host:'http://line.assad2026.site:80',user:'QMZy2025',pass:'eck3gzk2uf'},
+            // سيرفرات مثبّتة: مش بتتمسح (لا بالزر ولا بالفحص التلقائي) وبترجع لو اتمسحت
+            {id:'pre_srv_4',type:'xtream',pinned:true,label:'MegoTV',host:'http://megotv.xyz',user:'mamdououh138',pass:'276202034aa',expiryTs:1826236799,expiryDate:'١٤ نوفمبر ٢٠٢٧'},
+            {id:'pre_srv_5',type:'xtream',pinned:true,label:'6060vu',host:'http://6060vu.top',user:'00971582222404',pass:'vult222404',expiryTs:1805846399,expiryDate:'٢٣ مارس ٢٠٢٧'},
+          ];
+          const isPinned=id=>PRELOADED_SERVERS.some(x=>x.pinned&&x.id===id);""")
+          rep("for(const x of [...servers]) if(x.expiryTs&&x.expiryTs*1000<=Date.now()) await removeServerRecord(x.id);",
+              "for(const x of [...servers]) if(!isPinned(x.id)&&x.expiryTs&&x.expiryTs*1000<=Date.now()) await removeServerRecord(x.id);")
+          rep("    for(const ps of PRELOADED_SERVERS){\n      if(!dp.includes(ps.id)",
+          """    for(const ps of PRELOADED_SERVERS.filter(x=>x.pinned)){
+                const cur=servers.find(x=>x.id===ps.id);
+                const rec=cur?{...cur,...ps,rating:cur.rating,lastUsed:cur.lastUsed,tags:cur.tags}:{...ps};
+                if(cur&&cur.expiryTs){rec.expiryTs=cur.expiryTs;rec.expiryDate=cur.expiryDate||ps.expiryDate;rec.unlimited=cur.unlimited;}
+                await dbPut(STORE_SRV,rec);
+                servers=[...servers.filter(x=>x.id!==ps.id),rec];
+              }
+              for(const ps of PRELOADED_SERVERS.filter(x=>!x.pinned)){
+                if(!dp.includes(ps.id)""")
+          rep("async function removeServerRecord(id){\n","async function removeServerRecord(id){\n  if(isPinned(id))return;\n")
+          rep("      const id=btn.dataset.del;\n      await dbDelete(STORE_SRV,id);","      const id=btn.dataset.del;\n      if(isPinned(id)){toast('🔒 السيرفر دة مثبّت ومش بيتمسح');return;}\n      await dbDelete(STORE_SRV,id);")
+          rep("      const id=btn.dataset.pqdel;\n      await dbDelete(STORE_SRV,id);","      const id=btn.dataset.pqdel;\n      if(isPinned(id)){toast('🔒 السيرفر دة مثبّت ومش بيتمسح');return;}\n      await dbDelete(STORE_SRV,id);")
+          rep("""      <button class="server-del" data-del="${esc(s.id)}"><svg""","""      <button class="server-del" data-del="${esc(s.id)}" ${isPinned(s.id)?'style="opacity:.35"':''}>${isPinned(s.id)?'🔒':''}<svg ${isPinned(s.id)?'style="display:none"':''}""")
+          rep("""      <button class="plist-del" data-pqdel="${esc(s.id)}">
+                  <svg viewBox""","""      <button class="plist-del" data-pqdel="${esc(s.id)}" ${isPinned(s.id)?'style="opacity:.4"':''}>
+                  ${isPinned(s.id)?'🔒':''}<svg ${isPinned(s.id)?'style="display:none"':''} viewBox""")
+
+          open(p, 'w', encoding='utf-8').write(s)
+          print('patched OK')
+          PYEOF
+          python3 patch.py
+
+      - name: Create Capacitor project from index.html
+        run: |
+          mkdir -p www
+          cp index.html www/index.html
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.youssef.iptv",
+            "appName": "Youssef IP TV",
+            "webDir": "www",
+            "server": { "androidScheme": "http", "cleartext": true },
+            "android": { "allowMixedContent": true },
+            "plugins": { "CapacitorHttp": { "enabled": true } }
+          }
+          EOF
+          npx cap add android
+
+      - name: Patch Android (rotation, fullscreen, VLC)
+        run: |
+          D=android/app/src/main/java/com/youssef/iptv
+          sed -i 's/<application/<application android:usesCleartextTraffic="true"/' android/app/src/main/AndroidManifest.xml
+          cat > $D/NativePlugin.java <<'EOF'
+          package com.youssef.iptv;
+
+          import android.content.ActivityNotFoundException;
+          import android.content.Intent;
+          import android.content.pm.ActivityInfo;
+          import android.net.Uri;
+          import android.view.Window;
+          import androidx.core.view.WindowCompat;
+          import androidx.core.view.WindowInsetsCompat;
+          import androidx.core.view.WindowInsetsControllerCompat;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          @CapacitorPlugin(name = "Native")
+          public class NativePlugin extends Plugin {
+
+            @PluginMethod
+            public void openVlc(PluginCall call) {
+              String url = call.getString("url");
+              if (url == null) { call.reject("no url"); return; }
+              try {
+                Intent i = new Intent(Intent.ACTION_VIEW);
+                i.setDataAndType(Uri.parse(url), "video/*");
+                i.setPackage("org.videolan.vlc");
+                getActivity().startActivity(i);
+                call.resolve();
+              } catch (ActivityNotFoundException e) {
+                call.reject("VLC_NOT_FOUND");
+              } catch (Exception e) {
+                call.reject(String.valueOf(e.getMessage()));
+              }
+            }
+
+            @PluginMethod
+            public void setOrientation(PluginCall call) {
+              final String mode = call.getString("mode", "auto");
+              getActivity().runOnUiThread(() -> {
+                int o = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+                if ("landscape".equals(mode)) o = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE;
+                else if ("portrait".equals(mode)) o = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+                getActivity().setRequestedOrientation(o);
+                call.resolve();
+              });
+            }
+
+            @PluginMethod
+            public void setImmersive(PluginCall call) {
+              final boolean on = Boolean.TRUE.equals(call.getBoolean("on", false));
+              getActivity().runOnUiThread(() -> {
+                Window w = getActivity().getWindow();
+                WindowInsetsControllerCompat c = WindowCompat.getInsetsController(w, w.getDecorView());
+                if (on) {
+                  c.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                  c.hide(WindowInsetsCompat.Type.systemBars());
+                } else {
+                  c.show(WindowInsetsCompat.Type.systemBars());
+                }
+                call.resolve();
+              });
+            }
+          }
+          EOF
+          cat > $D/MainActivity.java <<'EOF'
+          package com.youssef.iptv;
+
+          import android.os.Bundle;
+          import android.view.WindowManager;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              registerPlugin(NativePlugin.class);
+              super.onCreate(savedInstanceState);
+              getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            }
+          }
+          EOF
+
+      - name: Build APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Youssef-IPTV-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
